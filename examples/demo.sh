@@ -8,7 +8,10 @@
 set -euo pipefail
 
 TL="$(cd "$(dirname "$0")/.." && pwd)/tl"
-TEAM="$(mktemp -d)/team"
+SANDBOX="$(mktemp -d)"
+TEAM="$SANDBOX/team"
+export TL_HOME="$SANDBOX/home"   # the demo never touches your real ~/.teamlog
+unset TL_ROOT TL_ME
 "$TL" init "$TEAM" >/dev/null
 cd "$TEAM"
 
@@ -24,7 +27,7 @@ say "Four people join. Each says what they own and care about."
 ./tl join bob --owns "review, ci" >/dev/null
 ./tl join carol --owns "pricing" >/dev/null
 ./tl join dave --owns "roadmap" --cares "enterprise" --interrupt "outage" >/dev/null
-rm .tl/me   # one machine plays everyone, so identity comes from TL_ME
+# one machine plays everyone here, so each command says who it is with TL_ME
 head -6 people/dave.md
 
 say "Their agents write to the log. Nobody picks recipients, except where an answer is needed."

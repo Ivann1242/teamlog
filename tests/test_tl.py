@@ -4,6 +4,7 @@ Run with:  python3 -m unittest discover -s tests -v
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -13,9 +14,10 @@ from pathlib import Path
 TL = Path(__file__).resolve().parent.parent / "tl"
 
 
-def clean_env(**extra):
+def clean_env(home, **extra):
+    """An environment that can never touch the real ~/.teamlog or the real agent settings."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("TL_", "GIT_"))}
-    env.update(extra)
+    env.update(HOME=str(home), TL_HOME=str(Path(home) / ".teamlog"), **extra)
     return env
 
 
@@ -25,6 +27,7 @@ class Team(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name) / "team"
+        self.home = Path(self._tmp.name) / "home"
         self.clock = 0
         self.tl(None, "init", str(self.root), cwd=self._tmp.name)
 
@@ -36,7 +39,7 @@ class Team(unittest.TestCase):
             # Every call gets its own second so entries are ordered as written.
             self.clock += 1
             now = "2026-10-06T10:%02d:%02d" % divmod(self.clock, 60)
-        env = clean_env(TL_ROOT=str(self.root), TL_NOW=now, **({"TL_ME": me} if me else {}))
+        env = clean_env(self.home, TL_ROOT=str(self.root), TL_NOW=now, **({"TL_ME": me} if me else {}))
         r = subprocess.run([sys.executable, str(TL), *args], input=stdin or "", capture_output=True,
                            text=True, cwd=cwd or self.root, env=env)
         if check and r.returncode != 0:
@@ -48,7 +51,8 @@ class Team(unittest.TestCase):
         for k, v in kw.items():
             args += [f"--{k}", v]
         self.tl(None, *args)
-        (self.root / ".tl" / "me").unlink()
+        for f in (self.home / ".teamlog" / "local").glob("*/me"):
+            f.unlink()      # one machine plays the whole team: identity comes from TL_ME only
 
     def write(self, me, text, **kw):
         return self.tl(me, "write", text, **kw).stdout.strip()
@@ -72,9 +76,13 @@ class Team(unittest.TestCase):
 
 class TestBasics(Team):
     def test_init_creates_a_self_contained_team_space(self):
-        for p in ("log", "people", "hub", "AGENTS.md", "CLAUDE.md", "tl", ".gitignore"):
+        for p in ("log", "people", "hub", "AGENTS.md", "CLAUDE.md", "README.md", "tl"):
             self.assertTrue((self.root / p).exists(), p)
-        self.assertEqual((self.root / ".gitignore").read_text().split(), [".tl/"])
+        # nothing private to one machine lives in the shared space
+        self.join("alice")
+        self.tl("alice", "ack")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.name != ".git"),
+                         ["AGENTS.md", "CLAUDE.md", "README.md", "hub", "log", "people", "tl"])
 
     def test_init_refuses_to_overwrite(self):
         self.assertNotEqual(self.tl(None, "init", str(self.root), check=False).returncode, 0)
@@ -379,7 +387,8 @@ class GitTeam(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.sh(self.tmp, "git", "init", "-q", "--bare", "-b", "main", "remote.git")
         seed = self.tmp / "seed"
-        subprocess.run([sys.executable, str(TL), "init", str(seed)], capture_output=True, check=True, env=clean_env())
+        subprocess.run([sys.executable, str(TL), "init", str(seed)], capture_output=True, check=True,
+                       env=clean_env(self.tmp / "home_seed"))
         self.identity(seed, "seed")
         self.sh(seed, "git", "add", "-A")
         self.sh(seed, "git", "commit", "-q", "-m", "teamlog")
@@ -393,7 +402,8 @@ class GitTeam(unittest.TestCase):
         self._tmp.cleanup()
 
     def sh(self, cwd, *cmd):
-        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True, env=clean_env()).stdout
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True,
+                              env=clean_env(self.tmp / "home_git")).stdout
 
     def identity(self, repo, name):
         self.sh(repo, "git", "config", "user.name", name)
@@ -409,7 +419,7 @@ class GitTeam(unittest.TestCase):
     def tl(self, name, *args, check=True):
         repo = self.tmp / name
         r = subprocess.run([sys.executable, str(repo / "tl"), *args], input="", capture_output=True,
-                           text=True, cwd=repo, env=clean_env())
+                           text=True, cwd=repo, env=clean_env(self.tmp / f"home_{name}"))
         if check and r.returncode != 0:
             self.fail(f"[{name}] tl {' '.join(args)} failed: {r.stderr}")
         return r
@@ -466,6 +476,7 @@ class TestSync(GitTeam):
 [ -f "{self.tmp}/raced" ] && exit 0
 touch "{self.tmp}/raced"
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+export HOME="{self.tmp}/home_alice" TL_HOME="{self.tmp}/home_alice/.teamlog"
 cd "{self.tmp}/alice" && "{sys.executable}" ./tl write "sneaks in first" >/dev/null \\
   && git add -A && git commit -q -m race && git pull -q --rebase && git push -q --no-verify
 """)
@@ -502,9 +513,10 @@ cd "{self.tmp}/alice" && "{sys.executable}" ./tl write "sneaks in first" >/dev/n
         (code / "app.py").write_text("x = 1\n")
         self.sh(code, "git", "add", "-A")
         self.sh(code, "git", "commit", "-q", "-m", "code")
-        subprocess.run([sys.executable, str(TL), "init", str(code / "team")], capture_output=True, check=True, env=clean_env())
+        env = clean_env(self.tmp / "home_code")
+        subprocess.run([sys.executable, str(TL), "init", str(code / "team")], capture_output=True, check=True, env=env)
         run = lambda *a: subprocess.run([sys.executable, "./tl", *a], cwd=code / "team", capture_output=True,
-                                        text=True, check=True, env=clean_env()).stdout
+                                        text=True, check=True, env=env).stdout
         run("join", "alice")
         (code / "app.py").write_text("x = 2  # work in progress\n")
         run("write", "first entry")
@@ -535,6 +547,136 @@ class TestProvenance(GitTeam):
         self.assertIn("committed by mallory <mallory@example.com>", shown)
         self.assertIn("WARNING", shown)
         self.assertNotIn("WARNING", self.out("bob", "show", real))
+
+
+class TestSetup(unittest.TestCase):
+    """`tl setup` is the whole onboarding. Each "machine" here is a separate HOME."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.tmp / "myteam.git")], check=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def machine(self, name):
+        home = self.tmp / name
+        (home / ".claude").mkdir(parents=True, exist_ok=True)
+        (home / "work" / "some-project").mkdir(parents=True, exist_ok=True)
+        return home
+
+    def tl(self, name, *args, script=None, check=True):
+        """Run tl the way that person would: from an unrelated project directory."""
+        home = self.machine(name)
+        env = clean_env(home, PATH=f"{home / '.local' / 'bin'}{os.pathsep}{os.environ['PATH']}",
+                        GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=f"{name}@example.com",
+                        GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=f"{name}@example.com")
+        cmd = [sys.executable, str(script or TL)] if script or not (home / ".teamlog" / "bin" / "tl").exists() else ["tl"]
+        r = subprocess.run([*cmd, *args], input="", capture_output=True, text=True,
+                           cwd=home / "work" / "some-project", env=env)
+        if check and r.returncode != 0:
+            self.fail(f"[{name}] tl {' '.join(args)} failed: {r.stderr}")
+        return r.stdout
+
+    def test_first_run_installs_and_lists_every_question_once(self):
+        out = self.tl("alice", "setup")
+        self.assertTrue((self.tmp / "alice" / ".teamlog" / "bin" / "tl").exists())
+        self.assertIn("on your PATH as `tl`", out)
+        for flag in ("--new <name>", "--join <url-or-folder>", "--me <name>", "--owns", "--everywhere"):
+            self.assertIn(flag, out)
+        self.assertEqual(len(re.findall(r"^ \d\. ", out, re.M)), 4, "setup asks four things, no more")
+        self.assertIn("ONCE", out)
+        self.assertIn("~/.claude/CLAUDE.md", out)   # says exactly which file --everywhere would touch
+        self.assertNotIn(str(self.tmp), out)        # and shows paths the way people write them
+
+    def test_new_team_in_one_command_then_usable_from_any_directory(self):
+        notes = self.tmp / "alice" / ".claude" / "CLAUDE.md"
+        self.machine("alice")
+        notes.write_text("# my own notes\n")
+        out = self.tl("alice", "setup", "--new", "myteam", "--me", "alice", "--owns", "login, sso",
+                      "--log-freely", "--everywhere")
+        self.assertIn("All set.", out)
+        team = self.tmp / "alice" / ".teamlog" / "myteam"
+        self.assertIn("owns: login, sso", (team / "people" / "alice.md").read_text())
+        self.assertIn("may write to the team log without showing me", (team / "people" / "alice.md").read_text())
+        text = notes.read_text()
+        self.assertTrue(text.startswith("# my own notes\n"))
+        self.assertIn('alice\'s agent on the team "myteam"', text)
+        self.assertIn("`tl check`", text)
+        # from an unrelated project directory
+        self.assertIn("teamlog · alice · local only (no git remote)", self.tl("alice", "check"))
+        self.tl("alice", "write", "written from another project")
+        self.assertIn("written from another project", self.tl("alice", "log"))
+        # asked once: a second run has no questions left
+        again = self.tl("alice", "setup")
+        self.assertIn("All set.", again)
+        self.assertNotIn("Ask your human", again)
+        # the note can be taken out again, leaving the rest of the file alone
+        self.tl("alice", "setup", "--here-only")
+        self.assertEqual(notes.read_text(), "# my own notes\n")
+        self.tl("alice", "setup", "--everywhere")
+        self.tl("alice", "setup", "--everywhere")
+        self.assertEqual(notes.read_text().count("teamlog:start"), 1)
+
+    def test_a_teammate_joins_from_the_team_url_alone(self):
+        url = str(self.tmp / "myteam.git")
+        self.tl("alice", "setup", "--new", "myteam", "--me", "alice", "--owns", "login", "--here-only")
+        team = self.tmp / "alice" / ".teamlog" / "myteam"
+        subprocess.run(["git", "-C", str(team), "branch", "-M", "main"], check=True)
+        subprocess.run(["git", "-C", str(team), "remote", "add", "origin", url], check=True)
+        self.assertIn("synced", self.tl("alice", "check"))
+        self.assertIn(f"shared at   {url}", self.tl("alice", "setup"))
+        # Bob's agent was given only the URL: it clones, then runs the copy of tl it finds inside.
+        bob_team = self.tmp / "bob" / ".teamlog" / "myteam"
+        self.machine("bob")
+        subprocess.run(["git", "clone", "-q", url, str(bob_team)], check=True)
+        out = self.tl("bob", "setup", script=bob_team / "tl")
+        self.assertNotIn("Start a new team", out)    # it already knows which team
+        self.assertIn("--me <name>", out)
+        self.tl("bob", "setup", "--me", "bob", "--owns", "review", "--here-only")
+        self.tl("bob", "write", "@alice 你好，我加入了")
+        self.tl("bob", "check")
+        out = self.tl("alice", "check")
+        self.assertIn("你好，我加入了", out)
+        self.assertNotIn("WARNING", out)             # bob's git identity was recorded when he joined
+        # the same thing, straight from the URL
+        self.tl("carol", "setup", "--join", url, "--me", "carol", "--here-only")
+        self.assertIn("bob", self.tl("carol", "status"))
+
+    def test_a_shared_folder_works_without_git(self):
+        shared = self.tmp / "Dropbox" / "myteam"
+        self.tl("alice", "setup", "--new", "myteam", "--at", str(shared), "--me", "alice", "--here-only")
+        self.assertFalse((shared / ".git").exists())
+        self.tl("bob", "setup", "--join", str(shared), "--me", "bob", "--here-only")
+        self.tl("bob", "write", "@alice 这个文件夹是同步盘")
+        out = self.tl("alice", "check")
+        self.assertIn("local only (not a git repository)", out)
+        self.assertIn("这个文件夹是同步盘", out)
+        self.assertEqual(self.tl("alice", "whoami").strip(), "alice")   # identities do not leak through the folder
+        self.assertEqual(self.tl("bob", "whoami").strip(), "bob")
+
+    def test_an_older_copy_never_replaces_a_newer_install(self):
+        self.tl("alice", "setup")
+        installed = self.tmp / "alice" / ".teamlog" / "bin" / "tl"
+        old = self.tmp / "old_tl"
+        old.write_text(TL.read_text().replace(f'VERSION = "{self.tl("alice", "--version").split()[-1]}"',
+                                              'VERSION = "0.0.1"'))
+        self.tl("alice", "setup", script=old)
+        self.assertNotIn('VERSION = "0.0.1"', installed.read_text())
+
+    def test_guide_prints_the_rules_for_use_from_anywhere(self):
+        self.tl("alice", "setup", "--new", "myteam", "--me", "alice", "--here-only")
+        out = self.tl("alice", "guide")
+        self.assertIn("Run `tl check`", out)
+        self.assertNotIn("./tl", out)
+
+    def test_no_team_gives_a_pointer_not_a_traceback(self):
+        r = subprocess.run([sys.executable, str(TL), "check"], capture_output=True, text=True, input="",
+                           cwd=self.machine("zed"), env=clean_env(self.tmp / "zed"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("tl setup", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
 
 if __name__ == "__main__":

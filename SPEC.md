@@ -1,6 +1,6 @@
 # The teamlog format
 
-Version 0.3. This page is the whole format. Anything that reads and writes files this way interoperates; `tl` is one implementation of it.
+Version 0.4. This page is the whole format. Anything that reads and writes files this way interoperates; `tl` is one implementation of it.
 
 A team space is a directory, normally a git repository.
 
@@ -8,8 +8,9 @@ A team space is a directory, normally a git repository.
 log/<id>.md         entries and routing records; append-only
 people/<name>.md    one profile per teammate
 hub/seen-<name>     ids of the entries <name>'s agent has made a routing decision for
-.tl/                local to one machine, never shared: identity and acknowledgements
 ```
+
+Nothing else belongs in a team space. What is private to one machine (who you are there, what you have acknowledged) is kept outside it, so the space can be shared by any means that syncs a folder.
 
 ## Names
 
