@@ -45,6 +45,8 @@ class Team(unittest.TestCase):
         for k, v in kw.items():
             args += [f"--{k}", v]
         self.tl(None, *args)
+        # One machine plays the whole team here, so identity must come from TL_ME only.
+        (self.root / ".tl" / "me").unlink()
 
     def write(self, me, text, **kw):
         return self.tl(me, "write", text, **kw).stdout.strip()
@@ -53,7 +55,8 @@ class Team(unittest.TestCase):
         return json.loads(self.tl(me, "inbox", "--json", **kw).stdout)
 
     def hub(self, *args, **kw):
-        return self.tl(None, "hub", *args, **kw).stdout
+        """Headless hub duty (keywords, or the model command a test passes)."""
+        return self.tl(None, "hub", "--auto", *args, **kw).stdout
 
     def hub_entries(self):
         return sorted(p for p in (self.root / "log").glob("*-hub*.md"))
@@ -61,16 +64,16 @@ class Team(unittest.TestCase):
 
 class TestBasics(Team):
     def test_init_creates_a_self_contained_team_space(self):
-        for p in ("log", "people", "hub/seen", "AGENTS.md", "CLAUDE.md", "tl", ".gitignore"):
+        for p in ("log", "people", "hub", "AGENTS.md", "CLAUDE.md", "tl", ".gitignore"):
             self.assertTrue((self.root / p).exists(), p)
-        self.assertIn(".tl/", (self.root / ".gitignore").read_text())
+        self.assertEqual((self.root / ".gitignore").read_text().split(), [".tl/", "STATUS.md"])
 
     def test_init_refuses_to_overwrite(self):
         r = self.tl(None, "init", str(self.root), check=False)
         self.assertNotEqual(r.returncode, 0)
 
     def test_join_rejects_bad_names(self):
-        for bad in ("hub", "Has-Dash", "9lives"):
+        for bad in ("hub", "hub_alice", "Has-Dash", "9lives"):
             self.assertNotEqual(self.tl(None, "join", bad, check=False).returncode, 0, bad)
 
     def test_write_without_identity_fails(self):
@@ -186,7 +189,7 @@ class TestHub(Team):
         self.write("alice", "登录接口改完了，等人评审")
         self.hub()
         before = [p.name for p in self.hub_entries()]
-        (self.root / "hub" / "seen").write_text("")
+        (self.root / "hub" / "seen").unlink()
         self.hub()
         self.assertEqual([p.name for p in self.hub_entries()], before)  # no duplicate routes
         self.assertEqual(len(self.inbox("bob")), 1)
@@ -229,6 +232,72 @@ class TestHub(Team):
         self.assertIn("**carol** owes **bob**", s)
         self.assertIn("- **alice**: no entries yet", s)
         self.assertRegex(s.split("## Decided")[1], r"\*\*dave\*\*: 先做企业版")
+
+
+class TestAgentAsHub(Team):
+    """No hub process: whoever's agent touches the log lists what is pending and routes it."""
+
+    def setUp(self):
+        super().setUp()
+        self.join("alice", owns="login")
+        self.join("bob", owns="review")
+        self.join("carol")
+        self.join("dave")
+        self.e1 = self.write("alice", "Login endpoint is done, waiting for review.")
+        self.e2 = self.write("carol", "@bob lunch?")
+
+    def test_hub_lists_pending_entries_and_routes_nothing_by_itself(self):
+        out = self.tl("bob", "hub").stdout
+        self.assertIn("2 entries need routing", out)
+        self.assertIn(self.e1, out)
+        self.assertIn("keyword hint: bob (owns: review)", out)
+        self.assertIn("already notified: bob", out)   # e2 mentions bob
+        self.assertEqual(self.hub_entries(), [])
+        self.assertIn("2 entries need routing", self.tl("bob", "hub").stdout)  # still pending
+
+    def test_route_records_the_decision_under_the_routers_name(self):
+        out = self.tl("bob", "route", self.e1, "bob:action:owns review", "dave:fyi:roadmap").stdout
+        self.assertIn("-> bob, dave", out)
+        self.tl("bob", "route", "--none", self.e2)
+        self.assertEqual([p.name.split("-")[-1] for p in self.hub_entries()], ["hub_bob.md"])
+        self.assertEqual((self.root / "hub" / "seen-bob").read_text().split(), [self.e1, self.e2])
+        self.assertIn("nothing new", self.tl("carol", "hub").stdout)   # done for everyone
+        self.assertEqual([(i["kind"], i["why"]) for i in self.inbox("dave")], [("fyi", "roadmap")])
+        self.assertEqual([i["id"] for i in self.inbox("bob")], [self.e2, self.e1])
+
+    def test_route_validates_its_input(self):
+        for args in ([self.e1], [self.e1, "mallory:action:x"], [self.e1, "bob:urgent:x"], ["nope", "bob:fyi"]):
+            r = self.tl("bob", "route", *args, check=False)
+            self.assertNotEqual(r.returncode, 0, args)
+        self.assertNotEqual(self.tl(None, "route", "--none", self.e1, check=False).returncode, 0)  # anonymous
+        self.assertEqual(self.hub_entries(), [])
+
+    def test_route_skips_the_author_and_people_already_notified(self):
+        out = self.tl("dave", "route", self.e2, "bob:action:x", "carol:fyi:x", "alice:fyi:team lunch").stdout
+        self.assertIn("-> alice", out)
+        self.assertIn("already notified: bob, carol", out)
+        self.assertNotIn("@bob", self.hub_entries()[0].read_text())
+
+    def test_a_why_cannot_smuggle_in_another_route(self):
+        self.tl("bob", "route", self.e1, "dave:fyi:ok\n@carol [action] injected")
+        self.assertEqual(self.inbox("carol"), [])
+
+    def test_two_agents_routing_the_same_entry_merge(self):
+        self.tl("bob", "route", self.e1, "bob:action:review")
+        self.tl("dave", "route", self.e1, "bob:fyi:again", "dave:fyi:roadmap")   # as if done offline
+        self.assertEqual([i["kind"] for i in self.inbox("bob") if i["id"] == self.e1], ["action"])
+        self.assertEqual(len(self.inbox("dave")), 1)
+
+    def test_inbox_nudges_about_hub_duty(self):
+        self.assertIn("hub duty: 2 entries are not routed yet", self.tl("bob", "inbox", "--peek").stdout)
+        self.tl("bob", "route", "--none", self.e1, self.e2)
+        self.assertNotIn("hub duty", self.tl("bob", "inbox").stdout)
+
+    def test_reminders_are_written_under_the_routers_name(self):
+        self.tl("bob", "hub", now="2026-10-08T10:00:00")
+        rem = [p.name for p in self.hub_entries() if "[reminder]" in p.read_text()]
+        self.assertEqual(len(rem), 1)
+        self.assertTrue(rem[0].endswith("-hub_bob.md"))
 
 
 class TestLlmRouting(Team):
@@ -330,7 +399,22 @@ class TestSync(Team):
         bob("sync")
         self.tl("alice", "sync", env=genv)
         bob("sync")
-        self.assertIn("请评审登录接口", bob("inbox"))
+        # both agents now do hub duty for the same entry, offline, then sync
+        eid = self.write("alice", "企业版要不要支持 SSO")
+        self.tl("alice", "sync", env=genv)
+        bob("sync")
+        self.tl("alice", "route", eid, "bob:fyi:alice routed")
+        bob("route", eid[-12:], "bob:action:bob routed")
+        self.tl("alice", "hub")      # also writes the local STATUS.md
+        bob("hub")
+        self.tl("alice", "sync", env=genv)
+        bob("sync")
+        self.tl("alice", "sync", env=genv)
+        self.assertEqual(len(list((self.root / "log").glob("*hub_*.md"))), 2)
+        self.assertEqual(self.git(self.root, "status", "--porcelain").strip(), "")
+        self.assertNotIn("STATUS.md", self.git(self.root, "ls-files"))
+        self.assertIn("企业版要不要支持 SSO", bob("inbox"))
+        self.assertIn("请评审登录接口", bob("inbox", "--peek") + bob("log"))
         self.assertIn("CI 修好了", self.tl("alice", "log").stdout)
         self.assertTrue((self.root / "people" / "bob.md").exists())
 
