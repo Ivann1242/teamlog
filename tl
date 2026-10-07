@@ -20,11 +20,14 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 HUB = "hub"
 REMIND_MAX = 3
+SPACE = ".teamlog"   # a team space embedded in a working directory, found the way .git is
+BRANCH = "teamlog"   # in a git project the space is a worktree of this branch
 # How to spell this command in hints: `./tl` when run from a team space's own copy.
 CMD = "./tl" if sys.argv[0].startswith("./") else "tl"
 SHOW_MAX = 20  # items per tier in one check; the rest appear after `tl ack`
@@ -103,8 +106,13 @@ def is_team(d: Path) -> bool:
 
 
 def find_root(required: bool = True):
-    """The team space: $TL_ROOT, else the one the current directory is inside,
-    else this machine's default team. So `tl` works from any directory."""
+    """The team space for where you are standing.
+
+    $TL_ROOT wins. Otherwise walk up from the current directory, the way git
+    looks for .git: a directory that holds a `.teamlog` space (the normal
+    case: the team log lives inside the project or shared folder), or that is
+    a space itself. Failing that, this machine's standalone default team.
+    """
     env = os.environ.get("TL_ROOT")
     if env:
         if is_team(Path(env)):
@@ -112,14 +120,21 @@ def find_root(required: bool = True):
         die(f"TL_ROOT={env} is not a team space (no log/ and people/ there)")
     here = Path.cwd()
     for d in [here, *here.parents]:
+        if is_team(d / SPACE):
+            return d / SPACE
         if is_team(d):
             return d
     team = load_config().get("team")
     if team and is_team(Path(team)):
         return Path(team)
     if required:
-        die("no team here, and this machine has no default team. Run `tl setup`.")
+        die("no team log here. Run `tl setup` in your project or shared folder.")
     return None
+
+
+def project_of(root: Path):
+    """The working directory a team space is embedded in, or None for a standalone space."""
+    return root.parent if root.name == SPACE else None
 
 
 def local_dir(root: Path) -> Path:
@@ -138,9 +153,9 @@ def whoami(root: Path, required: bool = True) -> str:
     return me.lower()
 
 
-def git(root: Path, *args):
+def git(root: Path, *args, input=None):
     try:
-        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, input=input)
     except FileNotFoundError:
         return subprocess.CompletedProcess(args, 127, "", "git is not installed")
 
@@ -664,7 +679,7 @@ NOTE_START, NOTE_END = "<!-- teamlog:start -->", "<!-- teamlog:end -->"
 
 def agent_files() -> list:
     """Global instruction files of the agents installed on this machine."""
-    return [(label, Path.home() / d / f) for label, d, f in AGENT_HOMES if (Path.home() / d).is_dir()]
+    return [Path.home() / d / f for _, d, f in AGENT_HOMES if (Path.home() / d).is_dir()]
 
 
 def strip_note(text: str) -> str:
@@ -674,19 +689,38 @@ def strip_note(text: str) -> str:
     return text
 
 
-def set_everywhere(on: bool, cmd: str, me: str, team: str) -> list:
-    """Add or remove the short note that tells an agent about the team in every project."""
-    touched = []
-    for label, f in agent_files():
-        old = f.read_text(encoding="utf-8") if f.exists() else ""
-        new = strip_note(old)
-        if on:
-            new = (new.rstrip("\n") + "\n\n" if new.strip() else "") + GLOBAL_NOTE.format(
-                start=NOTE_START, end=NOTE_END, cmd=cmd, me=me, team=team)
-        if new != old:
-            f.write_text(new, encoding="utf-8")
-            touched.append((label, f))
-    return touched
+def write_note(f: Path, block) -> bool:
+    """Put `block` into file `f` between the teamlog markers, replacing an older one.
+    With block=None the note is removed. Everything else in the file is left alone."""
+    old = f.read_text(encoding="utf-8") if f.exists() else ""
+    new = strip_note(old)
+    if block:
+        new = (new.rstrip("\n") + "\n\n" if new.strip() else "") + f"{NOTE_START}\n{block.strip()}\n{NOTE_END}\n"
+    if new == old:
+        return False
+    if new.strip() or f.exists():
+        f.write_text(new, encoding="utf-8")
+    return True
+
+
+def set_everywhere(on: bool) -> list:
+    """The short note that makes a person's agents look for a team log in every project."""
+    return [f for f in agent_files() if write_note(f, GLOBAL_NOTE if on else None)]
+
+
+def set_pointer(project: Path, on: bool, in_git: bool) -> list:
+    """The note in a project's own instruction files, so every teammate's agent finds the log."""
+    names = [n for n in ("AGENTS.md", "CLAUDE.md", "GEMINI.md") if (project / n).exists()]
+    if on and not names:
+        names = ["AGENTS.md"] + (["CLAUDE.md"] if (Path.home() / ".claude").is_dir() else [])
+    if "AGENTS.md" in names and (project / "CLAUDE.md").exists() and \
+            "@AGENTS.md" in (project / "CLAUDE.md").read_text(encoding="utf-8"):
+        names.remove("CLAUDE.md")       # it already pulls AGENTS.md in
+    block = (PROJECT_NOTE_GIT if in_git else PROJECT_NOTE_FOLDER) if on else None
+    fresh_claude = on and "CLAUDE.md" in names and not (project / "CLAUDE.md").exists()
+    # A CLAUDE.md we create ourselves just pulls in AGENTS.md, so the note exists once.
+    return [project / n for n in names
+            if write_note(project / n, "@AGENTS.md" if fresh_claude and n == "CLAUDE.md" else block)]
 
 
 def install_self() -> tuple:
@@ -716,14 +750,83 @@ def install_self() -> tuple:
     return ("tl" if on_path else str(dest)), on_path
 
 
+def git_top(d: Path):
+    r = git(d, "rev-parse", "--show-toplevel")
+    return Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+
+
+def has_branch(top: Path) -> bool:
+    """Does this git project already carry a team log, locally or on its remote?"""
+    return any(git(top, "rev-parse", "-q", "--verify", ref).returncode == 0
+               for ref in (f"refs/heads/{BRANCH}", f"refs/remotes/origin/{BRANCH}"))
+
+
+def exclude_space(top: Path):
+    """Keep .teamlog/ out of the project's `git status`, without touching the project's own files."""
+    common = Path(git(top, "rev-parse", "--git-common-dir").stdout.strip())
+    exclude = (common if common.is_absolute() else top / common) / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    if f"{SPACE}/" not in (exclude.read_text(encoding="utf-8").split() if exclude.exists() else []):
+        with open(exclude, "a", encoding="utf-8") as fh:
+            fh.write(f"{SPACE}/\n")
+
+
+def embed(where: Path) -> tuple:
+    """Give the working directory `where` a team log at .teamlog/. Returns (space, what happened).
+
+    In a git project the space is a worktree of the branch `teamlog`: it travels
+    through the project's own remote, with the project's own permissions, and
+    never touches the code's history or whichever branch you are on. In a plain
+    folder it is just a folder, shared however that folder is shared.
+    """
+    top = git_top(where)
+    if not top:
+        root = where / SPACE
+        if is_team(root):
+            return root, "found"
+        init_space(root, use_git=False)
+        return root, "created"
+    root = top / SPACE
+    exclude_space(top)
+    if is_team(root):
+        return root, "found"
+    if git(top, "remote", "get-url", "origin").returncode == 0:
+        git(top, "fetch", "-q", "origin", BRANCH)
+    git(top, "worktree", "prune")
+    if git(top, "rev-parse", "-q", "--verify", f"refs/heads/{BRANCH}").returncode == 0:
+        r, how = git(top, "worktree", "add", "-q", str(root), BRANCH), "joined"
+    elif git(top, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{BRANCH}").returncode == 0:
+        r, how = git(top, "worktree", "add", "-q", "--track", "-b", BRANCH, str(root), f"origin/{BRANCH}"), "joined"
+    else:
+        tree = git(top, "hash-object", "-t", "tree", "--stdin", input="").stdout.strip()
+        c = git(top, "commit-tree", tree, "-m", "teamlog")     # a branch with no history in common with the code
+        if c.returncode != 0:
+            die("git needs to know who you are first:\n  git config --global user.name \"Your Name\"\n"
+                "  git config --global user.email you@example.com")
+        git(top, "branch", BRANCH, c.stdout.strip())
+        r, how = git(top, "worktree", "add", "-q", str(root), BRANCH), "created"
+        if r.returncode == 0:
+            init_space(root, use_git=False)
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "teamlog: start")
+    if r.returncode != 0 or not is_team(root):
+        die(f"could not set up {tilde(root)}: " + (first_line(r.stderr) or "it is not a team space"))
+    return root, how
+
+
 def cmd_setup(a):
     cmd, on_path = install_self()
+    cmd = cmd if on_path else tilde(cmd)
     cfg = load_config()
+    here = Path.cwd()
+    if sum(bool(x) for x in (a.here, a.new, a.join)) > 1:
+        die("--here, --new and --join are different things; pick one")
 
     # 1. the team
-    if a.new and a.join:
-        die("--new and --join are two different things; pick one")
-    if a.new:
+    root, how, noted = None, "", []
+    if a.here:
+        root, how = embed(here)
+    elif a.new:
         name = a.new.lower()
         if not NAME_RE.match(name):
             die("a team name is lowercase letters, digits or _")
@@ -747,32 +850,34 @@ def cmd_setup(a):
                     die(f"could not get a team space from {a.join}: "
                         + (first_line(r.stderr) or "it has no log/ and people/"))
         cfg["team"] = str(root)
-    elif not cfg.get("team") or not is_team(Path(cfg["team"])):
-        # e.g. `~/.teamlog/myteam/tl setup`, run from a freshly cloned team space
-        here = find_root(required=False)
-        if not here and is_team(Path(__file__).resolve().parent):
-            here = Path(__file__).resolve().parent
-        if here:
-            cfg["team"] = str(here.resolve())
-        else:
-            cfg.pop("team", None)
+    else:
+        root = find_root(required=False)
+        if not root and git_top(here) and (git(git_top(here), "fetch", "-q", "origin", BRANCH) or True) \
+                and has_branch(git_top(here)):
+            root, how = embed(here)         # this project already has a team log: join it
+        if not root and is_team(Path(__file__).resolve().parent):
+            root = Path(__file__).resolve().parent      # setup run from a cloned standalone space
+            cfg["team"] = str(root)
+    project = project_of(root) if root else None
+    if project and git_top(project):
+        exclude_space(git_top(project))     # also when the worktree was added by hand
+    if project and how == "created" and not a.no_pointer:   # only whoever starts the log adds the note
+        noted = set_pointer(project, True, bool(git_top(project)))
     save_config(cfg)
-    root = Path(cfg["team"]) if cfg.get("team") else None
 
     # 2. who you are
     if a.me:
         if not root:
-            die("there is no team yet: add --new <name> or --join <url-or-folder>")
+            die("there is no team yet: add --here, --new <name> or --join <url-or-folder>")
         join_team(root, a.me, a.owns, a.cares, a.ignores, a.interrupt, a.log_freely)
+    newcomer = bool(a.me) and root and len(load_people(root)) > 1 \
+        and not any(e.author == a.me.lower() for e in load_entries(root))
     me = whoami(root, required=False) if root else ""
 
-    # 3. everywhere, or only inside the team folder
+    # 3. every project, or only the ones whose own instructions mention the team log
     if a.everywhere or a.here_only:
-        if a.everywhere and not (root and me):
-            die("--everywhere needs a team and a name first")
-        touched = set_everywhere(bool(a.everywhere), cmd, me, root.name if root else "")
+        set_everywhere(bool(a.everywhere))
         cfg["everywhere"] = bool(a.everywhere)
-        cfg["everywhere_files"] = [str(f) for _, f in agent_files()] if a.everywhere else []
         save_config(cfg)
     everywhere = cfg.get("everywhere")
 
@@ -780,20 +885,23 @@ def cmd_setup(a):
           + (" and on your PATH as `tl`." if on_path else
              ".\nIt is not on your PATH in this shell. Call it by that full path, or first run:\n"
              f"  export PATH=\"{tilde(Path.home() / '.local' / 'bin')}:$PATH\"   (add that line to your shell profile to keep it)"))
+    if how == "joined":
+        print(f"This project already has a team log; it is now at {tilde(root)}.")
 
-    missing = [not root, not me, everywhere is None]
-    if any(missing):
+    if not root or not me or everywhere is None:
         print("\nAsk your human the questions below ONCE, all together and in their language,")
         print("then run the single command at the end with their answers.\n")
         n, flags = 0, []
         if not root:
             n += 1
-            print(f" {n}. Start a new team, or join one that exists?")
-            print("      new   a short team name                           --new <name>")
-            print("      join  the team's repository URL or shared folder  --join <url-or-folder>")
-            flags.append("(--new <name> | --join <url-or-folder>)")
+            what = f"this project ({git_top(here).name})" if git_top(here) else f"this folder ({here.name})"
+            print(f" {n}. Where does the team's log live?")
+            print(f"      in {what}, for the people who share it (the usual choice)   --here")
+            print("      on its own, not tied to any folder: a short team name          --new <name>")
+            print("      it exists already: its repository URL or shared folder         --join <url-or-folder>")
+            flags.append("(--here | --new <name> | --join <url-or-folder>)")
         if not me:
-            guess = re.sub(r"[^a-z0-9_]", "", (git(Path.cwd(), "config", "user.name").stdout.split() or
+            guess = re.sub(r"[^a-z0-9_]", "", (git(here, "config", "user.name").stdout.split() or
                                                [os.environ.get("USER", "")])[0].lower())
             hint = f" (suggest: {guess})" if NAME_RE.match(guess or "") and not is_hub(guess) else ""
             print(f" {n + 1}. Your name on the team: short and lowercase{hint}   --me <name>")
@@ -801,10 +909,9 @@ def cmd_setup(a):
             n += 2
             flags.append("--me <name> --owns \"...\"")
         if everywhere is None:
-            files = ", ".join(tilde(f) for _, f in agent_files()) or "no agent found on this machine yet"
-            print(f" {n + 1}. Should your agent keep an eye on the team from every project, not only when it is")
-            print("    opened in the team folder?")
-            print(f"      yes   --everywhere   (adds a five-line note to: {files})")
+            files = ", ".join(tilde(f) for f in agent_files()) or "no agent found on this machine yet"
+            print(f" {n + 1}. Should your agent look for a team log in every project it is opened in?")
+            print(f"      yes   --everywhere   (adds a short note to: {files})")
             print("      no    --here-only")
             flags.append("(--everywhere | --here-only)")
         print(f"\n  {cmd} setup " + " ".join(flags))
@@ -814,28 +921,41 @@ def cmd_setup(a):
             print("entry first, add it to their profile (people/<name>.md in the team space) and tell them.")
         return
 
-    remote = git(root, "remote", "get-url", "origin").stdout.strip()
-    in_git = git(root, "rev-parse", "--is-inside-work-tree").returncode == 0
-    print(f"\nAll set.\n  team        {root.name}  ({tilde(root)})\n  you         {me}")
-    if remote:
-        print(f"  shared at   {remote}")
-        print("  invite      send that URL to a teammate; their agent can set everything up from it")
-    elif in_git:
-        print("  shared at   nowhere yet. To invite teammates, create an empty private repository, then run")
-        print(f"                git -C {tilde(root)} remote add origin <its-url> && {cmd} check")
-        if shutil.which("gh"):
-            print("              or, with the GitHub CLI, in one step (ask your human before creating it):")
-            print(f"                gh repo create {root.name} --private --source {tilde(root)} --push")
-        print("              and send them that URL; their agent can set everything up from it.")
+    print(f"\nAll set.\n  you         {me}")
+    if project:
+        top = git_top(project)
+        print(f"  team log    {tilde(root)}  (the log of {project.name})")
+        if top and git(top, "remote", "get-url", "origin").returncode == 0:
+            print(f"  shared      through this project's own remote, on the branch `{BRANCH}`. Everyone who can")
+            print("              push to the project is on the team; the code's history is not touched.")
+        elif top:
+            print(f"  shared      not yet: this project has no git remote. It is on the local branch `{BRANCH}`.")
+        else:
+            print("  shared      with the folder itself, however you share that folder")
+        if noted:
+            print("  teammates   a note for their agents was added to: " + ", ".join(tilde(f) for f in noted))
+            print("              It is not committed. Tell your human, so they can commit it with the project.")
+        else:
+            print(f"  teammates   their agents join with `{cmd} setup` inside the project")
     else:
-        print("  shared via  the folder itself (you sync it; teammates join with: tl setup --join <the folder>)")
-    if everywhere:
-        print("  everywhere  yes, noted in: " + (", ".join(tilde(f) for f in cfg.get("everywhere_files") or []) or "(no agent found)")
-              + f"   (undo: {cmd} setup --here-only)")
-    else:
-        print(f"  everywhere  no; open your agent in {tilde(root)} to use the team   (change: {cmd} setup --everywhere)")
+        remote = git(root, "remote", "get-url", "origin").stdout.strip()
+        print(f"  team log    {tilde(root)}  (standalone team {root.name})")
+        if remote:
+            print(f"  shared      {remote}   (send that URL to a teammate; their agent sets up from it)")
+        elif git(root, "rev-parse", "--is-inside-work-tree").returncode == 0:
+            print("  shared      nowhere yet. Create an empty private repository, then run")
+            print(f"                git -C {tilde(root)} remote add origin <its-url> && {cmd} check")
+        else:
+            print(f"  shared      with the folder itself (teammates join with: tl setup --join {tilde(root)})")
+    print("  everywhere  " + ("yes, noted in: " + (", ".join(tilde(f) for f in agent_files()) or "(no agent found)")
+                              + f"   (undo: {cmd} setup --here-only)" if everywhere else
+                              f"no   (change: {cmd} setup --everywhere)"))
+    if newcomer:
+        n = sum(1 for e in load_entries(root) if not is_hub(e.author))
+        print(f"\nYou are new here: {n} entr{'y was' if n == 1 else 'ies were'} written before you joined, and none of "
+              f"them was routed to you.\nRead the recent ones with `{cmd} log -n 30` and tell your human what touches their work.")
     print(f"\nNow run `{cmd} check`, then tell your human in their language what was set up, and that from now on")
-    print(f"they can ask you things like \"anything new on the team?\" or type `{cmd} check` themselves.")
+    print(f"they can ask you things like \"anything new on the team?\" or \"sync my progress\", or type `{cmd} check` themselves.")
 
 
 def cmd_guide(a):
@@ -845,6 +965,89 @@ def cmd_guide(a):
         me = whoami(root, required=False)
         print(f"\nThe team space is {tilde(root)}"
               + (f"; your human's profile is {tilde(root / 'people' / (me + '.md'))}." if me else "."))
+
+
+# ----------------------------------------------------------------- progress
+
+SKIP_DIRS = {"node_modules", "__pycache__", "venv", "dist", "build", "target"}
+
+
+def work_dir(root: Path) -> Path:
+    """Where the work happens: the directory the log is embedded in, else wherever you are."""
+    return project_of(root) or git_top(Path.cwd()) or Path.cwd()
+
+
+def read_marker(root: Path) -> dt.datetime:
+    """When this person last synced their progress here. A week ago if never."""
+    f = local_dir(root) / "progress"
+    try:
+        return dt.datetime.fromtimestamp(float(f.read_text(encoding="utf-8").strip()), dt.timezone.utc)
+    except (OSError, ValueError):
+        return now() - dt.timedelta(days=7)
+
+
+def gather_progress(root: Path, limit: int = 40) -> dict:
+    """What changed in the working directory since the last progress sync. Reads only; no model."""
+    where, since = work_dir(root), read_marker(root)
+    out = {"where": where, "since": since, "git": False, "commits": [], "dirty": [], "files": []}
+    top = git_top(where)
+    if top:
+        out["git"], out["where"] = True, top
+        email = git(top, "config", "user.email").stdout.strip()
+        # every code branch, but not the log's own branch (`--all` would also pull in its worktree's HEAD)
+        r = git(top, "log", f"--exclude={BRANCH}", "--branches", f"--exclude=*/{BRANCH}", "--remotes", "HEAD",
+                "--no-merges", f"--since=@{int(since.timestamp())}", "--format=%ct %h %ad %s", "--date=short",
+                *([f"--author={email}"] if email else []), "-n", str(limit))
+        # git compares whole seconds; drop a commit made just before the marker in the same second
+        out["commits"] = [ln.split(" ", 1)[1] for ln in (r.stdout.splitlines() if r.returncode == 0 else [])
+                          if int(ln.split(" ", 1)[0]) > since.timestamp() - 1e-6 or since.microsecond == 0]
+        out["branch"] = git(top, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        out["dirty"] = [ln for ln in git(top, "status", "--short").stdout.splitlines() if ln.strip()][:limit]
+        return out
+    cutoff, seen = since.timestamp(), 0
+    for d, dirs, files in os.walk(where):
+        dirs[:] = [x for x in dirs if not x.startswith(".") and x not in SKIP_DIRS]
+        for name in files:
+            seen += 1
+            if seen > 20000:
+                break
+            f = Path(d) / name
+            try:
+                if not name.startswith(".") and f.stat().st_mtime > cutoff:
+                    out["files"].append((f.stat().st_mtime, str(f.relative_to(where))))
+            except OSError:
+                pass
+    out["files"] = sorted(out["files"], reverse=True)[:limit]
+    return out
+
+
+def cmd_progress(a):
+    root = find_root()
+    whoami(root)
+    marker = local_dir(root) / "progress"
+    if a.done:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        # to the fraction of a second: file times are compared against this
+        stamp = now().timestamp() if os.environ.get("TL_NOW") else time.time()
+        marker.write_text(f"{stamp:.3f}\n", encoding="utf-8")
+        print("progress marked as synced up to now")
+        return
+    g = gather_progress(root)
+    print(f"Work in {tilde(g['where'])} since {show_time(g['since'])} (your last progress sync)\n")
+    if g["git"]:
+        print(f"On branch {g.get('branch', '?')}. Your commits, newest first:")
+        print("\n".join(f"  {c}" for c in g["commits"]) or "  none")
+        print("\nNot committed yet:")
+        print("\n".join(f"  {c}" for c in g["dirty"]) or "  nothing")
+    else:
+        print("Files changed (by anyone who shares this folder), newest first:")
+        print("\n".join(f"  {dt.datetime.fromtimestamp(t).strftime('%m-%d %H:%M')}  {name}" for t, name in g["files"])
+              or "  none")
+    print(f"""
+This is raw material, not a log entry. Look at what you need (`git show <commit>`, the files),
+then draft entries for your human: what teammates can now rely on or need to know, a few at most,
+with the commit or file as evidence. Leave out what nobody else depends on. Show your human the
+drafts, write the ones they approve, then run `{CMD} progress --done`.""")
 
 
 def cmd_whoami(a):
@@ -871,7 +1074,12 @@ def cmd_write(a):
 
 
 def cmd_check(a):
-    root = find_root()
+    root = find_root(required=False)
+    if not root:
+        top = git_top(Path.cwd())
+        print("No team log here." + (f" This project has one you have not joined: run `{CMD} setup`."
+                                     if top and has_branch(top) else ""))
+        return
     me = whoami(root, required=not a.auto)
     sync = {"state": "local", "arrived": 0, "detail": "--offline"} if a.offline else do_sync(root, me or HUB)
     entries, people = load_entries(root), load_people(root)
@@ -978,6 +1186,15 @@ def cmd_check(a):
         print("Nothing new for your human. Nothing to route.")
     elif not (new or still):
         print("\nNothing new for your human.")
+    if me and not a.auto:
+        g = gather_progress(root)
+        # Uncommitted changes are work in progress, not news: they do not trigger the nudge.
+        if g["commits"] or g["files"]:
+            what = (f"{len(g['commits'])} commit{'s' if len(g['commits']) != 1 else ''}, "
+                    f"{len(g['dirty'])} uncommitted change{'s' if len(g['dirty']) != 1 else ''}"
+                    if g["git"] else f"{len(g['files'])} changed file{'s' if len(g['files']) != 1 else ''}")
+            print(f"\nPROGRESS  {what} in {tilde(g['where'])} since {show_time(g['since'])} "
+                  f"not synced to the team: {CMD} progress")
 
 
 def cmd_ack(a):
@@ -1161,18 +1378,47 @@ your own. When they answer, run the one command it shows you.
 Afterwards `tl check` works from any directory. `tl guide` explains the rules.
 """
 
-GLOBAL_NOTE = """{start}
-## Teamlog
+GLOBAL_NOTE = """## Teamlog
 
-You are also {me}'s agent on the team "{team}". The team shares one log;
-nobody sends messages.
+Your human's teams keep shared logs inside the folders they work in
+(`.teamlog/`). Nobody sends messages; agents write short entries there.
+
+- At the start of a session, and before answering anything about a team, run
+  `tl check`. If it says there is no team log here, carry on normally.
+  Otherwise tell your human what it lists as NOW, and anything where someone
+  is waiting on them. Do their actual request first.
+- Before your first `tl write`, `reply`, `route`, `flag` or `progress` in a
+  session, read the rules once: `tl guide`.
+- If `tl` is not found, call it as `~/.teamlog/bin/tl`.
+"""
+
+PROJECT_NOTE_GIT = """## Team log
+
+This project's team keeps a shared log in `.teamlog/` (git branch `teamlog`,
+separate from the code). Nobody sends messages; agents write short entries.
 
 - At the start of a session, and before answering anything about the team,
-  run `{cmd} check`. Tell your human what it lists as NOW, and anything
-  where someone is waiting on them. Do their actual request first.
-- Before your first `{cmd} write`, `reply`, `route` or `flag` in a session,
-  read the rules once: `{cmd} guide`.
-{end}
+  run `tl check`. Tell your human what it lists as NOW, and anything where
+  someone is waiting on them. Do their actual request first.
+- Before your first `tl write`, `reply`, `route`, `flag` or `progress` in a
+  session, read the rules once: `tl guide`.
+- If `tl` or `.teamlog/` is missing, your human has not joined yet. Ask
+  them, then run:
+  `git fetch origin teamlog && git worktree add .teamlog teamlog && .teamlog/tl setup`
+"""
+
+PROJECT_NOTE_FOLDER = """## Team log
+
+The people who share this folder keep a shared log in `.teamlog/`. Nobody
+sends messages; agents write short entries.
+
+- At the start of a session, and before answering anything about the team,
+  run `tl check`. Tell your human what it lists as NOW, and anything where
+  someone is waiting on them. Do their actual request first.
+- Before your first `tl write`, `reply`, `route`, `flag` or `progress` in a
+  session, read the rules once: `tl guide`.
+- If `tl` is missing, your human has not joined yet. Ask them, then run:
+  `.teamlog/tl setup`
 """
 
 AGENTS_MD = """# Teamlog
@@ -1212,10 +1458,10 @@ The log speaks in your human's name.
   something from someone, decided something, or are blocked.
 - Show them the exact text first and wait for a yes, unless they dictated the
   wording or their profile says you may log without asking.
-- Only what they said, in the language they said it. Copy numbers, names
-  and units exactly, without converting them. Never add a currency, a reason
-  or a conclusion they did not state. Your own observations go to your
-  human, not into the log.
+- Only what they said, or what `./tl progress` shows they did, in their
+  language. Copy numbers, names and units exactly, without converting them.
+  Never add a currency, a reason or a conclusion they did not state. Your
+  own observations go to your human, not into the log.
 - One fact per entry, one to three sentences, understandable without
   context. No secrets. One yes can cover several entries.
 - `@name` asks that person to act. `cc @name` only informs. `#decision` marks
@@ -1227,6 +1473,14 @@ The log speaks in your human's name.
 - Entries are never edited. Correct one with a reply.
 
     ./tl write "text"        (or pipe the text on stdin to avoid shell quoting)
+
+## Progress from the working directory
+
+`./tl progress` lists your human's commits and changed files since the last
+sync. Run it when they ask you to sync progress, or at a natural break when
+`./tl check` shows a PROGRESS line. Turn it into a few entries about what
+teammates can now rely on, citing the commit, not a commit-by-commit list.
+Show your human, write, then `./tl progress --done`.
 
 ## Routing
 
@@ -1304,16 +1558,24 @@ def main():
     s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("setup", help="install tl for every project, create or join a team, say who you are")
-    s.add_argument("--new", metavar="NAME", help="start a new team")
+    s.add_argument("--here", action="store_true",
+                   help="keep the team's log in this project or folder, at .teamlog/")
+    s.add_argument("--no-pointer", action="store_true",
+                   help="with --here: do not add a note for teammates' agents to this project's AGENTS.md")
+    s.add_argument("--new", metavar="NAME", help="start a standalone team, not tied to any folder")
     s.add_argument("--at", metavar="DIR", help="with --new: put it in this folder, which you sync yourself (no git)")
     s.add_argument("--join", metavar="URL_OR_FOLDER", help="join an existing team")
     s.add_argument("--me", metavar="NAME", help="your name on the team")
     for k in ("owns", "cares", "ignores", "interrupt"):
         s.add_argument(f"--{k}", help="comma-separated keywords")
     s.add_argument("--log-freely", action="store_true", help="your agent may log without showing you each entry")
-    s.add_argument("--everywhere", action="store_true", help="tell your agents about the team in every project")
+    s.add_argument("--everywhere", action="store_true", help="have your agents look for a team log in every project")
     s.add_argument("--here-only", action="store_true", help="remove that note again")
     s.set_defaults(fn=cmd_setup)
+
+    s = sub.add_parser("progress", help="what changed in this working directory since you last synced progress")
+    s.add_argument("--done", action="store_true", help="mark everything up to now as synced")
+    s.set_defaults(fn=cmd_progress)
 
     s = sub.add_parser("guide", help="print the rules for agents")
     s.set_defaults(fn=cmd_guide)

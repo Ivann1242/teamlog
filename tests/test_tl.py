@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -116,7 +117,7 @@ class TestBasics(Team):
 
     def test_agent_instructions_stay_small(self):
         words = len((self.root / "AGENTS.md").read_text().split())
-        self.assertLess(words, 650, "AGENTS.md is read at the start of every session; keep it short")
+        self.assertLess(words, 700, "the rules are read by every agent before it writes; keep them short")
 
 
 class TestInbox(Team):
@@ -583,7 +584,7 @@ class TestSetup(unittest.TestCase):
         out = self.tl("alice", "setup")
         self.assertTrue((self.tmp / "alice" / ".teamlog" / "bin" / "tl").exists())
         self.assertIn("on your PATH as `tl`", out)
-        for flag in ("--new <name>", "--join <url-or-folder>", "--me <name>", "--owns", "--everywhere"):
+        for flag in ("--here", "--new <name>", "--join <url-or-folder>", "--me <name>", "--owns", "--everywhere"):
             self.assertIn(flag, out)
         self.assertEqual(len(re.findall(r"^ \d\. ", out, re.M)), 4, "setup asks four things, no more")
         self.assertIn("ONCE", out)
@@ -602,7 +603,7 @@ class TestSetup(unittest.TestCase):
         self.assertIn("may write to the team log without showing me", (team / "people" / "alice.md").read_text())
         text = notes.read_text()
         self.assertTrue(text.startswith("# my own notes\n"))
-        self.assertIn('alice\'s agent on the team "myteam"', text)
+        self.assertIn("If it says there is no team log here, carry on normally", text)
         self.assertIn("`tl check`", text)
         # from an unrelated project directory
         self.assertIn("teamlog · alice · local only (no git remote)", self.tl("alice", "check"))
@@ -626,7 +627,7 @@ class TestSetup(unittest.TestCase):
         subprocess.run(["git", "-C", str(team), "branch", "-M", "main"], check=True)
         subprocess.run(["git", "-C", str(team), "remote", "add", "origin", url], check=True)
         self.assertIn("synced", self.tl("alice", "check"))
-        self.assertIn(f"shared at   {url}", self.tl("alice", "setup"))
+        self.assertIn(f"shared      {url}", self.tl("alice", "setup"))
         # Bob's agent was given only the URL: it clones, then runs the copy of tl it finds inside.
         bob_team = self.tmp / "bob" / ".teamlog" / "myteam"
         self.machine("bob")
@@ -671,12 +672,187 @@ class TestSetup(unittest.TestCase):
         self.assertIn("Run `tl check`", out)
         self.assertNotIn("./tl", out)
 
-    def test_no_team_gives_a_pointer_not_a_traceback(self):
-        r = subprocess.run([sys.executable, str(TL), "check"], capture_output=True, text=True, input="",
-                           cwd=self.machine("zed"), env=clean_env(self.tmp / "zed"))
+    def test_where_there_is_no_team_check_says_so_and_carries_on(self):
+        run = lambda *a: subprocess.run([sys.executable, str(TL), *a], capture_output=True, text=True, input="",
+                                        cwd=self.machine("zed"), env=clean_env(self.tmp / "zed"))
+        r = run("check")            # an agent runs this in every project: it must not be an error
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "No team log here."))
+        r = run("write", "hello")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("tl setup", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
+
+
+class TestEmbedded(unittest.TestCase):
+    """The team log lives inside the working directory, at .teamlog/."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.git(self.tmp, "init", "-q", "--bare", "-b", "main", "app.git")
+        app = self.app("alice")
+        app.mkdir(parents=True)
+        self.git(app, "init", "-q", "-b", "main", who="alice")
+        (app / "src").mkdir()
+        (app / "src" / "login.py").write_text("x = 1\n")
+        self.commit("alice", "initial code")
+        self.git(app, "remote", "add", "origin", str(self.tmp / "app.git"), who="alice")
+        self.git(app, "push", "-q", "-u", "origin", "main", who="alice")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def home(self, name):
+        h = self.tmp / f"home_{name}"
+        (h / ".claude").mkdir(parents=True, exist_ok=True)
+        return h
+
+    def app(self, name):
+        return self.home(name) / "work" / "app"
+
+    def env(self, name):
+        h = self.home(name)
+        return clean_env(h, PATH=f"{h / '.local' / 'bin'}{os.pathsep}{os.environ['PATH']}",
+                         GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=f"{name}@example.com",
+                         GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=f"{name}@example.com",
+                         GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="user.email", GIT_CONFIG_VALUE_0=f"{name}@example.com")
+
+    def git(self, cwd, *args, who="alice", check=True):
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=self.env(who))
+        if check and r.returncode != 0:
+            self.fail(f"git {' '.join(args)}: {r.stderr}")
+        return r.stdout
+
+    def commit(self, who, message, path="src/login.py", author=None):
+        f = self.app(who) / path
+        f.write_text(f.read_text() + f"# {message}\n" if f.exists() else f"# {message}\n")
+        self.git(self.app(who), "add", "-A", "--", path, who=who)
+        self.git(self.app(who), "commit", "-q", "-m", message, who=author or who)
+
+    def tl(self, name, *args, cwd=None, check=True):
+        r = subprocess.run([sys.executable, str(TL), *args], input="", capture_output=True, text=True,
+                           cwd=cwd or self.app(name), env=self.env(name))
+        if check and r.returncode != 0:
+            self.fail(f"[{name}] tl {' '.join(args)} failed: {r.stderr}")
+        return r.stdout
+
+    def test_a_git_project_gets_its_log_on_a_separate_branch(self):
+        app = self.app("alice")
+        out = self.tl("alice", "setup", "--here", "--me", "alice", "--owns", "login", "--here-only")
+        self.assertIn("All set.", out)
+        self.assertIn("through this project's own remote, on the branch `teamlog`", out)
+        self.assertTrue((app / ".teamlog" / "log").is_dir())
+        # the code is untouched: same history, and the only new files are the note for teammates' agents
+        self.assertEqual(self.git(app, "log", "--oneline", "main").count("\n"), 1)
+        self.assertEqual(sorted(self.git(app, "status", "--porcelain").split()), ["??", "??", "AGENTS.md", "CLAUDE.md"])
+        self.assertIn("git worktree add .teamlog teamlog", (app / "AGENTS.md").read_text())
+        # the log shares no history with the code
+        self.assertNotEqual(subprocess.run(["git", "merge-base", "main", "teamlog"], cwd=app,
+                                           capture_output=True).returncode, 0)
+        # tl is found from anywhere inside the project, and syncs the log through the project's remote
+        self.tl("alice", "write", "登录接口改完了", cwd=app / "src")
+        self.assertIn("teamlog · alice · synced", self.tl("alice", "check", cwd=app / "src"))
+        self.assertIn("teamlog", self.git(self.tmp, "--git-dir", "app.git", "branch", "--list", "teamlog"))
+        self.assertEqual(self.git(app, "rev-parse", "--abbrev-ref", "HEAD").strip(), "main")
+
+    def test_a_teammate_who_clones_the_project_joins_without_any_link(self):
+        self.tl("alice", "setup", "--here", "--me", "alice", "--owns", "login", "--here-only")
+        self.tl("alice", "check")
+        self.git(self.app("alice"), "add", "AGENTS.md", "CLAUDE.md")
+        self.git(self.app("alice"), "commit", "-q", "-m", "note the team log")
+        self.git(self.app("alice"), "push", "-q")
+        # Bob only clones the project, as he would anyway.
+        self.home("bob")
+        self.git(self.home("bob"), "clone", "-q", str(self.tmp / "app.git"), "work/app", who="bob")
+        self.assertIn("This project has one you have not joined", self.tl("bob", "check"))
+        out = self.tl("bob", "setup")
+        self.assertIn("This project already has a team log", out)
+        self.assertNotIn("Where does the team's log live", out)
+        self.assertIn("--me <name>", out)
+        self.tl("alice", "write", "v1 文件现在会加载失败")
+        self.tl("alice", "route", "--none", "alice")      # nobody else was on the team yet
+        self.tl("alice", "check")
+        out = self.tl("bob", "setup", "--me", "bob", "--owns", "review", "--here-only")
+        self.assertIn("You are new here", out)             # so a newcomer is pointed at what came before
+        self.assertIn("log -n 30", out)
+        self.assertNotIn("You are new here", self.tl("bob", "setup"))
+        # they are on different code branches; the log does not care
+        self.git(self.app("bob"), "checkout", "-q", "-b", "feature", who="bob")
+        self.tl("bob", "write", "@alice 评审完成，可以合并")
+        self.assertIn("synced", self.tl("bob", "check"))
+        out = self.tl("alice", "check")
+        self.assertIn("评审完成，可以合并", out)
+        self.assertNotIn("WARNING", out)
+        self.assertEqual(self.git(self.app("bob"), "status", "--porcelain", who="bob").strip(), "")
+
+    def test_joining_by_hand_with_the_command_from_the_project_note(self):
+        self.tl("alice", "setup", "--here", "--me", "alice", "--owns", "login", "--here-only", "--no-pointer")
+        self.tl("alice", "check")
+        self.home("bob")
+        self.git(self.home("bob"), "clone", "-q", str(self.tmp / "app.git"), "work/app", who="bob")
+        app = self.app("bob")
+        self.git(app, "fetch", "-q", "origin", "teamlog", who="bob")
+        self.git(app, "worktree", "add", "-q", ".teamlog", "teamlog", who="bob")
+        r = subprocess.run([sys.executable, str(app / ".teamlog" / "tl"), "setup", "--me", "bob", "--owns", "review",
+                            "--here-only"], cwd=app, capture_output=True, text=True, input="", env=self.env("bob"))
+        self.assertIn("All set.", r.stdout, r.stderr)
+        self.assertEqual(self.git(app, "status", "--porcelain", who="bob").strip(), "")   # .teamlog/ is kept out
+
+    def test_progress_reads_the_working_directory(self):
+        self.tl("alice", "setup", "--here", "--me", "alice", "--owns", "login", "--here-only", "--no-pointer")
+        self.tl("alice", "progress", "--done")
+        time.sleep(1.1)
+        self.commit("alice", "session expiry is now 24h")
+        self.commit("alice", "add SSO callback endpoint")
+        self.commit("alice", "someone else's commit", author="mallory")   # e.g. pulled from a teammate
+        self.tl("alice", "write", "an entry, which is a commit on the teamlog branch")
+        self.tl("alice", "check")
+        (self.app("alice") / "src" / "wip.py").write_text("half done\n")
+        out = self.tl("alice", "progress")
+        self.assertIn("session expiry is now 24h", out)
+        self.assertIn("add SSO callback endpoint", out)
+        self.assertNotIn("someone else", out)       # only this person's work
+        self.assertNotIn("teamlog:", out)           # and not the log's own commits
+        self.assertIn("src/wip.py", out)
+        self.assertIn("PROGRESS  2 commits, 1 uncommitted change", self.tl("alice", "check"))
+        self.tl("alice", "progress", "--done")
+        time.sleep(1.1)
+        self.assertNotIn("PROGRESS", self.tl("alice", "check"))   # uncommitted work alone is not news
+        self.assertIn("  none", self.tl("alice", "progress"))
+
+    def test_no_pointer_leaves_the_project_alone_and_setup_is_repeatable(self):
+        app = self.app("alice")
+        self.tl("alice", "setup", "--here", "--me", "alice", "--owns", "login", "--here-only", "--no-pointer")
+        self.assertEqual(self.git(app, "status", "--porcelain").strip(), "")
+        (app / "AGENTS.md").write_text("# App\n\nUse tabs.\n")
+        (app / ".teamlog" / "log" / ".gitkeep").touch()
+        self.tl("alice", "setup", "--here")       # already there: nothing to redo, no second note
+        self.assertEqual((app / "AGENTS.md").read_text(), "# App\n\nUse tabs.\n")
+
+    def test_a_plain_shared_folder_works_the_same_way(self):
+        shared = self.tmp / "Dropbox" / "paper"
+        shared.mkdir(parents=True)
+        (shared / "outline.md").write_text("# Outline\n")
+        out = self.tl("alice", "setup", "--here", "--me", "alice", "--owns", "writing", "--here-only", cwd=shared)
+        self.assertIn("with the folder itself", out)
+        self.assertFalse((shared / ".teamlog" / ".git").exists() or (shared / ".git").exists())
+        self.assertIn(".teamlog/tl setup", (shared / "AGENTS.md").read_text())
+        # Bob has the same folder through the sync service; setup finds the log that is already there.
+        out = self.tl("bob", "setup", cwd=shared)
+        self.assertNotIn("Where does the team's log live", out)
+        self.tl("bob", "setup", "--me", "bob", "--owns", "experiments", "--here-only", cwd=shared)
+        self.assertEqual(self.tl("alice", "whoami", cwd=shared).strip(), "alice")
+        self.assertEqual(self.tl("bob", "whoami", cwd=shared).strip(), "bob")
+        self.tl("bob", "write", "@alice 实验结果放在 results.csv 了", cwd=shared)
+        self.assertIn("实验结果放在 results.csv 了", self.tl("alice", "check", cwd=shared))
+        self.tl("alice", "progress", "--done", cwd=shared)
+        time.sleep(1.1)
+        (shared / "draft.md").write_text("# Draft\n")
+        out = self.tl("alice", "progress", cwd=shared)
+        self.assertIn("draft.md", out)
+        self.assertNotIn("outline.md", out)
+        self.assertNotIn(".teamlog", out)
+        self.assertIn("PROGRESS  1 changed file", self.tl("alice", "check", cwd=shared))
 
 
 if __name__ == "__main__":

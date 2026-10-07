@@ -1,8 +1,8 @@
 # The teamlog format
 
-Version 0.4. This page is the whole format. Anything that reads and writes files this way interoperates; `tl` is one implementation of it.
+Version 0.5. This page is the whole format. Anything that reads and writes files this way interoperates; `tl` is one implementation of it.
 
-A team space is a directory, normally a git repository.
+A team space is a directory:
 
 ```
 log/<id>.md         entries and routing records; append-only
@@ -11,6 +11,15 @@ hub/seen-<name>     ids of the entries <name>'s agent has made a routing decisio
 ```
 
 Nothing else belongs in a team space. What is private to one machine (who you are there, what you have acknowledged) is kept outside it, so the space can be shared by any means that syncs a folder.
+
+## Where a team space lives
+
+Normally inside the directory the team works in, under the name `.teamlog`, and it is found the way `.git` is: by walking up from wherever you are.
+
+- In a git project, `.teamlog/` is a worktree of a branch named `teamlog` that shares no history with the code. The log then travels through the project's own remote with the project's own permissions, is the same on whichever code branch each person has checked out, and never appears in the code's history. Each clone lists `.teamlog/` in `.git/info/exclude`.
+- In a plain folder, `.teamlog/` is an ordinary subfolder, shared however the folder is shared.
+
+A team space may also stand alone, as its own directory or repository, for a team that shares no folder.
 
 ## Names
 
