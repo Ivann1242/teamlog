@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 HUB = "hub"
 REMIND_MAX = 3
 SPACE = ".teamlog"   # a team space embedded in a working directory, found the way .git is
@@ -873,89 +873,150 @@ def cmd_setup(a):
     newcomer = bool(a.me) and root and len(load_people(root)) > 1 \
         and not any(e.author == a.me.lower() for e in load_entries(root))
     me = whoami(root, required=False) if root else ""
+    if how == "joined":
+        print(f"This project already has a team log; it is now at {tilde(root)}.")
 
-    # 3. every project, or only the ones whose own instructions mention the team log
+    # 3. optional: have this person's agents look for a team log in every project
     if a.everywhere or a.here_only:
         set_everywhere(bool(a.everywhere))
         cfg["everywhere"] = bool(a.everywhere)
         save_config(cfg)
-    everywhere = cfg.get("everywhere")
 
     print(f"teamlog {VERSION} is installed at {tilde(tl_home() / 'bin' / 'tl')}"
           + (" and on your PATH as `tl`." if on_path else
              ".\nIt is not on your PATH in this shell. Call it by that full path, or first run:\n"
              f"  export PATH=\"{tilde(Path.home() / '.local' / 'bin')}:$PATH\"   (add that line to your shell profile to keep it)"))
-    if how == "joined":
-        print(f"This project already has a team log; it is now at {tilde(root)}.")
 
-    if not root or not me or everywhere is None:
-        print("\nAsk your human the questions below ONCE, all together and in their language,")
-        print("then run the single command at the end with their answers.\n")
-        n, flags = 0, []
-        if not root:
-            n += 1
-            what = f"this project ({git_top(here).name})" if git_top(here) else f"this folder ({here.name})"
-            print(f" {n}. Where does the team's log live?")
-            print(f"      in {what}, for the people who share it (the usual choice)   --here")
-            print("      on its own, not tied to any folder: a short team name          --new <name>")
-            print("      it exists already: its repository URL or shared folder         --join <url-or-folder>")
-            flags.append("(--here | --new <name> | --join <url-or-folder>)")
-        if not me:
-            guess = re.sub(r"[^a-z0-9_]", "", (git(here, "config", "user.name").stdout.split() or
-                                               [os.environ.get("USER", "")])[0].lower())
-            hint = f" (suggest: {guess})" if NAME_RE.match(guess or "") and not is_hub(guess) else ""
-            print(f" {n + 1}. Your name on the team: short and lowercase{hint}   --me <name>")
-            print(f" {n + 2}. What are you responsible for? A few keywords.   --owns \"a, b\"")
-            n += 2
-            flags.append("--me <name> --owns \"...\"")
-        if everywhere is None:
-            files = ", ".join(tilde(f) for f in agent_files()) or "no agent found on this machine yet"
-            print(f" {n + 1}. Should your agent look for a team log in every project it is opened in?")
-            print(f"      yes   --everywhere   (adds a short note to: {files})")
-            print("      no    --here-only")
-            flags.append("(--everywhere | --here-only)")
-        print(f"\n  {cmd} setup " + " ".join(flags))
-        if not me:
-            print("\nDo not ask more than this. Later, when your human mentions what else they want to hear")
-            print("about, what is worth interrupting them for, or that you may log without showing them each")
-            print("entry first, add it to their profile (people/<name>.md in the team space) and tell them.")
+    if not root or not me:
+        propose_setup(root, here, cmd)
         return
 
-    print(f"\nAll set.\n  you         {me}")
-    if project:
-        top = git_top(project)
-        print(f"  team log    {tilde(root)}  (the log of {project.name})")
-        if top and git(top, "remote", "get-url", "origin").returncode == 0:
-            print(f"  shared      through this project's own remote, on the branch `{BRANCH}`. Everyone who can")
-            print("              push to the project is on the team; the code's history is not touched.")
-        elif top:
-            print(f"  shared      not yet: this project has no git remote. It is on the local branch `{BRANCH}`.")
-        else:
-            print("  shared      with the folder itself, however you share that folder")
-        if noted:
-            print("  teammates   a note for their agents was added to: " + ", ".join(tilde(f) for f in noted))
-            print("              It is not committed. Tell your human, so they can commit it with the project.")
-        else:
-            print(f"  teammates   their agents join with `{cmd} setup` inside the project")
-    else:
-        remote = git(root, "remote", "get-url", "origin").stdout.strip()
-        print(f"  team log    {tilde(root)}  (standalone team {root.name})")
-        if remote:
-            print(f"  shared      {remote}   (send that URL to a teammate; their agent sets up from it)")
-        elif git(root, "rev-parse", "--is-inside-work-tree").returncode == 0:
-            print("  shared      nowhere yet. Create an empty private repository, then run")
-            print(f"                git -C {tilde(root)} remote add origin <its-url> && {cmd} check")
-        else:
-            print(f"  shared      with the folder itself (teammates join with: tl setup --join {tilde(root)})")
-    print("  everywhere  " + ("yes, noted in: " + (", ".join(tilde(f) for f in agent_files()) or "(no agent found)")
-                              + f"   (undo: {cmd} setup --here-only)" if everywhere else
-                              f"no   (change: {cmd} setup --everywhere)"))
+    in_git = bool(project and git_top(project))
+    remote = in_git and git(git_top(project), "remote", "get-url", "origin").returncode == 0
+    place = project.name if project else root.name
+    print(f"""
+Set up. Now tell your human, in their own language and in plain words (no command names,
+no file paths unless they ask):
+
+  - The team notebook for "{place}" is ready, and they are in it as "{me}".
+  - From now on they can simply say things like "anything new on the team?",
+    "sync my progress" or "ask <teammate> when <something> will be ready".
+  - You will always show them the exact text before writing anything in their name.""")
+    if noted:
+        print(f"""  - To bring teammates in: you added a few lines to {", ".join(f.name for f in noted)} in this project.
+    Once that change is committed and pushed, a teammate's assistant will notice the notebook
+    when it opens the project and offer to join. Offer to commit it for them; do not commit
+    it without a yes.""")
+    elif project:
+        print("  - Teammates join by opening the project with their own assistant and asking it to join the team log.")
+    if in_git and not remote:
+        print("  - This project has no git remote yet, so for now the notebook only exists on this machine.")
     if newcomer:
         n = sum(1 for e in load_entries(root) if not is_hub(e.author))
-        print(f"\nYou are new here: {n} entr{'y was' if n == 1 else 'ies were'} written before you joined, and none of "
-              f"them was routed to you.\nRead the recent ones with `{cmd} log -n 30` and tell your human what touches their work.")
-    print(f"\nNow run `{cmd} check`, then tell your human in their language what was set up, and that from now on")
-    print(f"they can ask you things like \"anything new on the team?\" or \"sync my progress\", or type `{cmd} check` themselves.")
+        print(f"""
+They are new here: {n} entr{'y was' if n == 1 else 'ies were'} written before they joined, and none was routed to them.
+Read the recent ones with `{cmd} log -n 30` and tell them what touches their work.""")
+    print(f"""
+Then run `{cmd} check`. Before you write to the notebook for the first time, read `{cmd} guide`.
+
+For you, not for them unless they ask:
+  notebook    {tilde(root)}""" + (f"   (git branch `{BRANCH}` of this project, separate from the code)" if in_git else ""))
+    if not project:
+        r = git(root, "remote", "get-url", "origin").stdout.strip()
+        print("  shared      " + (r or "not shared yet: add a git remote to that folder, or keep it in a folder you share"))
+    print(f"  profile     {tilde(root / 'people' / (me + '.md'))}   (what they look after, when to interrupt them, and so on)")
+    if cfg.get("everywhere"):
+        print(f"  elsewhere   you also check for a team notebook in their other projects (undo: {cmd} setup --here-only)")
+    else:
+        print(f"  elsewhere   if they later want you to check for team notebooks in all their projects: {cmd} setup --everywhere")
+
+
+def guess_name(here: Path) -> str:
+    raw = (git(here, "config", "user.name").stdout.split() or [os.environ.get("USER", "")])[0].lower()
+    name = re.sub(r"[^a-z0-9_]", "", raw)
+    return name if NAME_RE.match(name or "") and not is_hub(name) else ""
+
+
+def recent_subjects(here: Path, n: int = 6) -> list:
+    top = git_top(here)
+    email = git(here, "config", "user.email").stdout.strip() if top else ""
+    r = git(top, "log", "HEAD", f"--author={email}", "--format=%s", "-n", str(n)) if email else None
+    return [one_line(x, 80) for x in r.stdout.splitlines()] if r and r.returncode == 0 else []
+
+
+def propose_setup(root, here: Path, cmd: str):
+    """Nothing is asked as a list of options. The agent is given a plan in plain words to put
+    to its human, who may never have heard of teamlog, and one question: is this all right?"""
+    top = git_top(here)
+    place = (project_of(root) or root).name if root else (top.name if top else here.name)
+    name = guess_name(here)
+    joining = bool(root)
+    mates = sorted(load_people(root)) if root else []
+    who_can = ("Anyone who can push to this project can read and write it; nobody else can."
+               if top else "Anyone who has this folder can read and write it.")
+
+    print(f"""
+Not finished yet: your human has to agree first. They may never have heard of teamlog, so
+explain it. Tell them the following IN THE LANGUAGE THEY WROTE TO YOU IN, in plain everyday
+words. Do not show them command names or options, and do not turn it into a list of choices.
+
+  WHAT THIS IS
+    A shared notebook for the people working on "{place}". Each person's AI assistant
+    writes short notes in it, such as "the login page is done and waiting for review" or
+    "I need the pricing numbers by Wednesday", and reads what the others wrote. So nobody
+    has to send status messages or hold status meetings: you only talk to your own
+    assistant, and it tells you what you need to know and passes on what you have done.
+""")
+    if joining:
+        print(f"""  WHERE THINGS STAND
+    "{place}" already has such a notebook"""
+              + (f", used by: {', '.join(mates)}." if mates else ".") + """ Joining means I will
+    read it for you, tell you when something concerns you, and write your progress into it.
+""")
+        print("  WHAT I WOULD DO")
+        steps = []
+    else:
+        print("  WHAT I WOULD DO")
+        steps = [f"""Keep the notebook inside "{place}", in a hidden folder."""
+                 + (" It is stored separately from your\n       code and never appears in its history." if top else "")
+                 + "\n       " + who_can]
+    steps.append(f"""Sign your notes as "{name}".""" if name else
+                 "Sign your notes with a short name. (Ask them which: lowercase letters, for example their first name.)")
+    recent = recent_subjects(here)
+    steps.append(("""Note down what you work on here, so that the other assistants know what to bring to your
+       attention. (Tell them, in a short phrase of your own, what you can see they have been
+       working on. Their recent commits here:
+"""
+                  + "\n".join(f"          - {c}" for c in recent) + ")") if recent else
+                 """Note down what you look after here, so the other assistants know what to bring to your
+       attention. (Ask them: "What do you mainly work on here? A few words is enough.")""")
+    if not joining:
+        steps.append("""Add a few lines to this project's notes for AI assistants (AGENTS.md), so your teammates'
+       assistants notice the notebook too. Nothing is committed without your say-so.""")
+    for i, step in enumerate(steps, 1):
+        print(f"    {i}. {step}")
+    print("""
+  WHAT I WILL NOT DO
+    Write anything in your name without showing you the exact text first.
+    Send anything anywhere other than """ + ("this project's own git remote." if top else "this folder.") + """
+
+Then ask ONE question: "Shall I set it up like this, or would you change anything?"
+(Again: in their language, not in English unless that is what they write.)""")
+    owns = "<that short phrase>" if recent_subjects(here) else "<what they said>"
+    print(f"""
+When they agree, run this, with the name and the phrase (their words, any language) they settled on:
+
+  {cmd} setup {"" if joining else "--here "}--me {name or "<name>"} --owns "{owns}\"""")
+    stray = here / "teamlog"
+    if (stray / "tl").exists() and (stray / "SPEC.md").exists():
+        print(f"""
+You also cloned teamlog into this project, at {tilde(stray)}. It does not belong there:
+delete that folder now (the installed copy is in ~/.teamlog).""")
+    if not joining:
+        print(f"""
+Only if they say the notebook should NOT live in this {"project" if top else "folder"}:
+  {cmd} setup --new <team-name> ...        a notebook of its own, not tied to any folder
+  {cmd} setup --join <url-or-folder> ...   one that a teammate has already created elsewhere""")
 
 
 def cmd_guide(a):
@@ -1439,6 +1500,9 @@ It syncs with the team, then prints what is new for your human and which
 entries still need routing. Act on what it prints.
 
 ## Telling your human
+
+Use plain words. Your human does not need to hear about commands, tiers,
+routing or entry ids unless they ask.
 
 - NOW: tell them immediately. LATER: at the next natural break. FYI: do not
   report it, but use it when it becomes relevant, and include it when they

@@ -584,12 +584,15 @@ class TestSetup(unittest.TestCase):
         out = self.tl("alice", "setup")
         self.assertTrue((self.tmp / "alice" / ".teamlog" / "bin" / "tl").exists())
         self.assertIn("on your PATH as `tl`", out)
-        for flag in ("--here", "--new <name>", "--join <url-or-folder>", "--me <name>", "--owns", "--everywhere"):
-            self.assertIn(flag, out)
-        self.assertEqual(len(re.findall(r"^ \d\. ", out, re.M)), 4, "setup asks four things, no more")
-        self.assertIn("ONCE", out)
-        self.assertIn("~/.claude/CLAUDE.md", out)   # says exactly which file --everywhere would touch
-        self.assertNotIn(str(self.tmp), out)        # and shows paths the way people write them
+        # It does not print a questionnaire. It hands the agent an explanation for someone who has
+        # never heard of teamlog, a plan with defaults filled in, and one question.
+        for part in ("WHAT THIS IS", "WHAT I WOULD DO", "WHAT I WILL NOT DO", "ONE question"):
+            self.assertIn(part, out)
+        self.assertIn('A shared notebook for the people working on "some-project"', out)
+        self.assertRegex(out, r"tl setup --here --me \S+ --owns")
+        self.assertIn("IN THE LANGUAGE THEY WROTE TO YOU IN", out)
+        self.assertNotIn("--everywhere", out)       # not something to decide on day one
+        self.assertNotIn(str(self.tmp), out)        # paths are shown the way people write them
 
     def test_new_team_in_one_command_then_usable_from_any_directory(self):
         notes = self.tmp / "alice" / ".claude" / "CLAUDE.md"
@@ -597,7 +600,7 @@ class TestSetup(unittest.TestCase):
         notes.write_text("# my own notes\n")
         out = self.tl("alice", "setup", "--new", "myteam", "--me", "alice", "--owns", "login, sso",
                       "--log-freely", "--everywhere")
-        self.assertIn("All set.", out)
+        self.assertIn("Set up.", out)
         team = self.tmp / "alice" / ".teamlog" / "myteam"
         self.assertIn("owns: login, sso", (team / "people" / "alice.md").read_text())
         self.assertIn("may write to the team log without showing me", (team / "people" / "alice.md").read_text())
@@ -611,7 +614,7 @@ class TestSetup(unittest.TestCase):
         self.assertIn("written from another project", self.tl("alice", "log"))
         # asked once: a second run has no questions left
         again = self.tl("alice", "setup")
-        self.assertIn("All set.", again)
+        self.assertIn("Set up.", again)
         self.assertNotIn("Ask your human", again)
         # the note can be taken out again, leaving the rest of the file alone
         self.tl("alice", "setup", "--here-only")
@@ -633,8 +636,8 @@ class TestSetup(unittest.TestCase):
         self.machine("bob")
         subprocess.run(["git", "clone", "-q", url, str(bob_team)], check=True)
         out = self.tl("bob", "setup", script=bob_team / "tl")
-        self.assertNotIn("Start a new team", out)    # it already knows which team
-        self.assertIn("--me <name>", out)
+        self.assertIn("already has such a notebook, used by: alice", out)    # it already knows which team
+        self.assertRegex(out, r"tl setup --me \S+ --owns")
         self.tl("bob", "setup", "--me", "bob", "--owns", "review", "--here-only")
         self.tl("bob", "write", "@alice 你好，我加入了")
         self.tl("bob", "check")
@@ -739,8 +742,9 @@ class TestEmbedded(unittest.TestCase):
     def test_a_git_project_gets_its_log_on_a_separate_branch(self):
         app = self.app("alice")
         out = self.tl("alice", "setup", "--here", "--me", "alice", "--owns", "login", "--here-only")
-        self.assertIn("All set.", out)
-        self.assertIn("through this project's own remote, on the branch `teamlog`", out)
+        self.assertIn("Set up.", out)
+        self.assertIn("(git branch `teamlog` of this project, separate from the code)", out)
+        self.assertIn("you added a few lines to AGENTS.md, CLAUDE.md", out)
         self.assertTrue((app / ".teamlog" / "log").is_dir())
         # the code is untouched: same history, and the only new files are the note for teammates' agents
         self.assertEqual(self.git(app, "log", "--oneline", "main").count("\n"), 1)
@@ -767,15 +771,16 @@ class TestEmbedded(unittest.TestCase):
         self.assertIn("This project has one you have not joined", self.tl("bob", "check"))
         out = self.tl("bob", "setup")
         self.assertIn("This project already has a team log", out)
-        self.assertNotIn("Where does the team's log live", out)
-        self.assertIn("--me <name>", out)
+        self.assertIn("already has such a notebook, used by: alice", out)
+        self.assertNotIn("--here", out)
+        self.assertRegex(out, r"tl setup --me \S+ --owns")
         self.tl("alice", "write", "v1 文件现在会加载失败")
         self.tl("alice", "route", "--none", "alice")      # nobody else was on the team yet
         self.tl("alice", "check")
         out = self.tl("bob", "setup", "--me", "bob", "--owns", "review", "--here-only")
-        self.assertIn("You are new here", out)             # so a newcomer is pointed at what came before
+        self.assertIn("They are new here", out)            # so a newcomer is pointed at what came before
         self.assertIn("log -n 30", out)
-        self.assertNotIn("You are new here", self.tl("bob", "setup"))
+        self.assertNotIn("They are new here", self.tl("bob", "setup"))
         # they are on different code branches; the log does not care
         self.git(self.app("bob"), "checkout", "-q", "-b", "feature", who="bob")
         self.tl("bob", "write", "@alice 评审完成，可以合并")
@@ -795,7 +800,7 @@ class TestEmbedded(unittest.TestCase):
         self.git(app, "worktree", "add", "-q", ".teamlog", "teamlog", who="bob")
         r = subprocess.run([sys.executable, str(app / ".teamlog" / "tl"), "setup", "--me", "bob", "--owns", "review",
                             "--here-only"], cwd=app, capture_output=True, text=True, input="", env=self.env("bob"))
-        self.assertIn("All set.", r.stdout, r.stderr)
+        self.assertIn("Set up.", r.stdout, r.stderr)
         self.assertEqual(self.git(app, "status", "--porcelain", who="bob").strip(), "")   # .teamlog/ is kept out
 
     def test_progress_reads_the_working_directory(self):
@@ -834,12 +839,13 @@ class TestEmbedded(unittest.TestCase):
         shared.mkdir(parents=True)
         (shared / "outline.md").write_text("# Outline\n")
         out = self.tl("alice", "setup", "--here", "--me", "alice", "--owns", "writing", "--here-only", cwd=shared)
-        self.assertIn("with the folder itself", out)
+        self.assertIn('The team notebook for "paper" is ready', out)
         self.assertFalse((shared / ".teamlog" / ".git").exists() or (shared / ".git").exists())
         self.assertIn(".teamlog/tl setup", (shared / "AGENTS.md").read_text())
         # Bob has the same folder through the sync service; setup finds the log that is already there.
         out = self.tl("bob", "setup", cwd=shared)
-        self.assertNotIn("Where does the team's log live", out)
+        self.assertIn("already has such a notebook, used by: alice", out)
+        self.assertIn("Anyone who has this folder", self.tl("carol", "setup", cwd=self.tmp / "Dropbox"))
         self.tl("bob", "setup", "--me", "bob", "--owns", "experiments", "--here-only", cwd=shared)
         self.assertEqual(self.tl("alice", "whoami", cwd=shared).strip(), "alice")
         self.assertEqual(self.tl("bob", "whoami", cwd=shared).strip(), "bob")
