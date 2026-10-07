@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 HUB = "hub"
 REMIND_MAX = 3
 SPACE = ".teamlog"   # a team space embedded in a working directory, found the way .git is
@@ -894,23 +894,31 @@ def cmd_setup(a):
     in_git = bool(project and git_top(project))
     remote = in_git and git(git_top(project), "remote", "get-url", "origin").returncode == 0
     place = project.name if project else root.name
+    mates = sorted(n for n in load_people(root) if n != me)
     print(f"""
-Set up. Now tell your human, in their own language and in plain words (no command names,
-no file paths unless they ask):
+Set up: "{place}" has a team notebook, and your human is on it as "{me}".
 
-  - The team notebook for "{place}" is ready, and they are in it as "{me}".
-  - From now on they can simply say things like "anything new on the team?",
-    "sync my progress" or "ask <teammate> when <something> will be ready".
-  - You will always show them the exact text before writing anything in their name.""")
+Now introduce it. Give your human everything between the two lines below, in the language
+they write to you in. Keep BOTH ways of using it. Keep it about this short; do not add
+internals (branches, routing, file paths) unless they ask.
+----------------------------------------------------------------------------------------
+{INTRO.replace("tl ", cmd + " ") if cmd != "tl" else INTRO}----------------------------------------------------------------------------------------""")
+    extra = []
+    if mates:
+        extra.append("Use their teammates' real names in the examples: " + ", ".join(mates) + ".")
+    else:
+        extra.append("Nobody else has joined yet, so say that the notebook becomes useful once a teammate is in.")
     if noted:
-        print(f"""  - To bring teammates in: you added a few lines to {", ".join(f.name for f in noted)} in this project.
-    Once that change is committed and pushed, a teammate's assistant will notice the notebook
-    when it opens the project and offer to join. Offer to commit it for them; do not commit
-    it without a yes.""")
-    elif project:
-        print("  - Teammates join by opening the project with their own assistant and asking it to join the team log.")
+        extra.append(f"""To bring teammates in: you added a few lines to {", ".join(f.name for f in noted)} in this project. Once that
+    change is committed and pushed, a teammate's assistant will notice the notebook when it opens
+    the project and offer to join. Offer to commit it for them; do not commit it without a yes.""")
+    elif project and not mates:
+        extra.append("Teammates join by opening the project with their own assistant and asking it to join the team log.")
     if in_git and not remote:
-        print("  - This project has no git remote yet, so for now the notebook only exists on this machine.")
+        extra.append("This project has no git remote yet, so for now the notebook only exists on this machine.")
+    print("\nAlso tell them:")
+    for line in extra:
+        print(f"  - {line}")
     if newcomer:
         n = sum(1 for e in load_entries(root) if not is_hub(e.author))
         print(f"""
@@ -1004,7 +1012,8 @@ Then ask ONE question: "Shall I set it up like this, or would you change anythin
 (Again: in their language, not in English unless that is what they write.)""")
     owns = "<that short phrase>" if recent_subjects(here) else "<what they said>"
     print(f"""
-When they agree, run this, with the name and the phrase (their words, any language) they settled on:
+When they agree, run this at once. Do NOT come back with a second question: if they only said yes,
+use the name above and your own short phrase for what they work on (their language is fine).
 
   {cmd} setup {"" if joining else "--here "}--me {name or "<name>"} --owns "{owns}\"""")
     stray = here / "teamlog"
@@ -1017,6 +1026,13 @@ delete that folder now (the installed copy is in ~/.teamlog).""")
 Only if they say the notebook should NOT live in this {"project" if top else "folder"}:
   {cmd} setup --new <team-name> ...        a notebook of its own, not tied to any folder
   {cmd} setup --join <url-or-folder> ...   one that a teammate has already created elsewhere""")
+
+
+def cmd_intro(a):
+    print(INTRO, end="")
+    root = find_root(required=False)
+    if not root:
+        print(f"\nThere is no team notebook where you are standing. `{CMD} setup` starts or joins one.")
 
 
 def cmd_guide(a):
@@ -1439,6 +1455,43 @@ your own. When they answer, run the one command it shows you.
 Afterwards `tl check` works from any directory. `tl guide` explains the rules.
 """
 
+INTRO = """WHAT IT DOES FOR YOU
+
+  - Tells you what concerns you. When a teammate needs something from you, or changes
+    something you depend on, you hear about it. The rest stays out of your way.
+  - Passes on your progress. It reads what you actually did here (your commits, the files
+    you changed) and drafts a few notes for your teammates. Nothing is written in your
+    name until you have seen the exact text and said yes.
+  - Asks for you and keeps track. A question to a teammate stays open until they answer,
+    and comes back after a day if they have not.
+  - Keeps the record: who is waiting on whom, and what was decided.
+
+TWO WAYS TO USE IT
+
+  1. Just talk to your assistant
+
+       "Anything new on the team?"
+       "Sync my progress."
+       "Ask <teammate> when <something> will be ready."
+       "Tell the team that <something>."
+       "Reply to <teammate>: <your answer>."
+       "Who is waiting on whom?"      "What did we decide about <topic>?"
+       "Stop telling me about <topic>."      "Always interrupt me for <topic>."
+
+  2. Or type the commands yourself
+
+       tl check               what is new for you
+       tl progress            what you have done here since you last shared it
+       tl write "..."         add a note; put @name in it to ask that person something
+       tl reply <id> "..."    answer a note
+       tl status              who is waiting on whom, and recent decisions
+       tl log                 the latest notes
+       tl intro               this overview again
+       tl <command> -h        details of one command
+
+  Both do the same thing. Mix them freely.
+"""
+
 GLOBAL_NOTE = """## Teamlog
 
 Your human's teams keep shared logs inside the folders they work in
@@ -1502,7 +1555,8 @@ entries still need routing. Act on what it prints.
 ## Telling your human
 
 Use plain words. Your human does not need to hear about commands, tiers,
-routing or entry ids unless they ask.
+routing or entry ids unless they ask. When they ask what teamlog can do or
+how to use it, give them `./tl intro` in their language.
 
 - NOW: tell them immediately. LATER: at the next natural break. FYI: do not
   report it, but use it when it becomes relevant, and include it when they
@@ -1640,6 +1694,9 @@ def main():
     s = sub.add_parser("progress", help="what changed in this working directory since you last synced progress")
     s.add_argument("--done", action="store_true", help="mark everything up to now as synced")
     s.set_defaults(fn=cmd_progress)
+
+    s = sub.add_parser("intro", help="what teamlog does and the two ways to use it")
+    s.set_defaults(fn=cmd_intro)
 
     s = sub.add_parser("guide", help="print the rules for agents")
     s.set_defaults(fn=cmd_guide)

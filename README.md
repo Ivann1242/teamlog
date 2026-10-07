@@ -37,7 +37,7 @@ Bob was never mentioned in Alice's entry above. It reached him because he owns r
 
 ## Set it up
 
-Open your agent in the project or folder your team shares, give it this page's URL and say "set up teamlog here". It installs `tl`, then explains in plain words what it is about to do and asks one thing: is this all right? The plan comes with the blanks filled in: the log goes in this project, you sign as your git name, and what you look after is read off your recent commits. Say yes, or say what to change.
+Open your agent in the project or folder your team shares, give it this page's URL and say "set up teamlog here". It installs `tl`, then explains in plain words what it is about to do and asks one thing: is this all right? The plan comes with the blanks filled in: the log goes in this project, you sign as your git name, and what you look after is read off your recent commits. Say yes, or say what to change. Once you agree it finishes the setup and introduces itself: what it does for you, and the two ways to use it.
 
 Teammates need no link. Setup leaves a short note in the project's `AGENTS.md`; once that is committed, any teammate's agent that opens the project sees it and offers to join.
 
@@ -72,7 +72,7 @@ With an agent you just talk: "anything new on the team?", "sync my progress", "a
 
 `tl check` sorts what is new into `NOW` (tell them immediately), `LATER` (next natural break) and `FYI` (no need to report), and says when you have work the team has not heard about. The tiers are a baseline from plain rules; an agent is expected to use judgment on top.
 
-Also there: `flag`, `log`, `show`, `status`, `guide`. Run `tl <command> -h`.
+Also there: `flag`, `log`, `show`, `status`, `guide`, and `tl intro`, which prints the short introduction again. Run `tl <command> -h`.
 
 ## How it sits in your working directory
 
@@ -115,7 +115,7 @@ That catches mistakes and casual impersonation, not a determined insider. Everyo
 
 ## Status
 
-v0.5.1, an experiment. Tested:
+v0.5.2, an experiment. Tested:
 
 - The tool: 61 end-to-end tests (`python3 -m unittest discover -s tests`), including a log embedded in a git project and in a plain folder, teammates joining from a clone, reading progress, setup on separate "machines", a push race, working offline and conflicting edits.
 - Agents: simulated team sessions with Claude models of three sizes, working only from what `tl` and the notes say. They set themselves up from a link, asked their human once, synced progress from real commits, noticed a project's team log and offered to join, routed the entries that mattered, asked before writing, and refused a forged entry that tried to instruct them.
